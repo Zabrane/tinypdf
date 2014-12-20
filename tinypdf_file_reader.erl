@@ -1,4 +1,4 @@
--module(tinypdf_file_parser).
+-module(tinypdf_file_reader).
 
 -behaviour(gen_server).
 
@@ -12,6 +12,7 @@
      root/1,
      find_object/2,
      get_object/2,
+     get_streams/2,
      pages/1,
      number_of_pages/1,
      page/2,
@@ -26,11 +27,11 @@ open(Filename) ->
     {ok, Version} = read_header(File),
     {ok, XRefOffset} = read_startxref(File),
     {ok, _} = file:position(File, XRefOffset),
-    {Root, Info, Offsets} = read_trailer(fun(N,B) -> buffer(N,B,File) end),
+    {Root, Info, Offsets} = read_trailer(fun(N,B) -> tinypdf_tokenizer:file_buffer(N,B,File) end),
 
     Pid =
         case supervisor:start_child(
-               tinypdf_file_parser_sup,
+               tinypdf_file_reader_sup,
                [File, Version, Root, Info, Offsets])
         of
             {ok, Child} ->
@@ -50,13 +51,28 @@ root(Pid) ->
     Object.
 
 
-find_object(Ref, Pid) ->
+find_object({ref, _, _} = Ref, Pid) ->
     gen_server:call(Pid, {find_object, Ref}).
 
 
-get_object(Ref, Pid) ->
+get_object({ref, _, _} = Ref, Pid) ->
     {ok, Object} = find_object(Ref, Pid),
+    Object;
+get_object(Object, _Pid) ->
     Object.
+
+
+get_streams([], Stream, _Pid) ->
+    Stream;
+get_streams([H|T], Stream, Pid) ->
+    Stream1 = get_streams(H, Stream, Pid),
+    get_streams(T, Stream1, Pid);
+get_streams({ref, _, _} = Ref, Stream, Pid) ->
+    {stream, _, Data} = get_object(Ref, Pid),
+    <<Stream/binary, Data/binary>>.
+
+get_streams(StreamRefs, Pid) ->
+    get_streams(StreamRefs, <<>>, Pid).
 
 
 pages(Pid) ->
@@ -178,7 +194,7 @@ lookup_object(Ref = {ref, Num, Gen}, State = #state{offsets=Offsets, object_cach
 get_object_from_offset(Offset, State = #state{file=File}) ->
     {ok, _} = file:position(File, Offset),
 
-    case parse_indirect_object(<<>>, fun(N,B) -> buffer(N,B,File) end, State) of
+    case parse_indirect_object(<<>>, fun(N,B) -> tinypdf_tokenizer:file_buffer(N,B,File) end, State) of
         {{object, Num, Ref, {stream, {dict, Dict}, RawStream}}, _, State1} ->
             {Filter, State2} = resolve_refs(proplists:get_value('Filter', Dict, null), State1),
             {DecodeParms, State3} = resolve_refs(proplists:get_value('DecodeParms', Dict, null), State2),
@@ -215,7 +231,7 @@ get_compressed_objects(Ref, State) ->
     {Objects, _} =
         lists:mapfoldl(
           fun (_, B) ->
-                  parse_object(B, fun(_,Buf)-> Buf end)
+                  tinypdf_object_parser:parse_object(B, fun(_,Buf)-> Buf end)
           end,
           Buffer,
           lists:seq(1,N)),
@@ -334,22 +350,23 @@ split_bytes(Bytes, [H|T], Stream) ->
 
 
 parse_trailer(Buffer, Fill) ->
-    {xref, Buffer1} = read_token(Buffer, Fill),
+    {xref, Buffer1} = tinypdf_tokenizer:read_token(Buffer, Fill),
     {Offsets, Buffer2} = parse_xref_subsections(dict:new(), Buffer1, Fill),
-    {{dict, Trailer}, _Buffer3} = parse_object(Buffer2, Fill),
+    {{dict, Trailer}, _Buffer3} = tinypdf_object_parser:parse_object(Buffer2, Fill),
     {Offsets, Trailer}.
 
 
 parse_xref_subsections(Offsets, Buffer, Fill) ->
-    case read_token(Buffer, Fill) of
+    case tinypdf_tokenizer:read_token(Buffer, Fill) of
         {trailer, Buffer1} ->
             {Offsets, Buffer1};
         {Start, Buffer1} when is_integer(Start) ->
-            {Count, Buffer2} = read_token(Buffer1, Fill),
-            {_, Buffer3} = readline(Buffer2, Fill),
+            {Count, Buffer2} = tinypdf_tokenizer:read_token(Buffer1, Fill),
+            {_, Buffer3} = tinypdf_tokenizer:readline(Buffer2, Fill),
             {Offsets1, Buffer4} = parse_xref_subsection(Start, Count, Offsets, Buffer3, Fill),
             parse_xref_subsections(Offsets1, Buffer4, Fill)
     end.
+
 
 parse_xref_subsection(_Start, 0, Offsets, Buffer, _Fill) ->
     {Offsets, Buffer};
@@ -366,12 +383,12 @@ parse_xref_subsection(Start, Count, Offsets, Buffer, Fill) ->
 
 
 parse_indirect_object(Buffer, Fill, State) ->
-    {Num, Buffer1} = read_token(Buffer, Fill),
-    {Gen, Buffer2} = read_token(Buffer1, Fill),
-    {obj, Buffer3} = read_token(Buffer2, Fill),
-    {Object, Buffer4} = parse_object(Buffer3, Fill),
+    {Num, Buffer1} = tinypdf_tokenizer:read_token(Buffer, Fill),
+    {Gen, Buffer2} = tinypdf_tokenizer:read_token(Buffer1, Fill),
+    {obj, Buffer3} = tinypdf_tokenizer:read_token(Buffer2, Fill),
+    {Object, Buffer4} = tinypdf_object_parser:parse_object(Buffer3, Fill),
 
-    case read_token(Buffer4, Fill) of
+    case tinypdf_tokenizer:read_token(Buffer4, Fill) of
         {endobj, Buffer5} ->
             {{object, Num, Gen, Object}, Buffer5, State};
         {stream, Buffer5} ->
@@ -386,340 +403,16 @@ parse_indirect_object(Buffer, Fill, State) ->
                         resolve_refs(RawLength, State)
                 end,
 
-            {_, Buffer6} = readline(Buffer5, Fill),
+            {_, Buffer6} = tinypdf_tokenizer:readline(Buffer5, Fill),
             Buffer7 = Fill(Length, Buffer6),
             Data = binary:part(Buffer7, 0, Length),
             Buffer8 = binary:part(Buffer7, Length, size(Buffer7) - Length),
 
 
-            {endstream, Buffer9} = read_token(Buffer8, Fill),
-            {endobj, Buffer10} = read_token(Buffer9, Fill),
+            {endstream, Buffer9} = tinypdf_tokenizer:read_token(Buffer8, Fill),
+            {endobj, Buffer10} = tinypdf_tokenizer:read_token(Buffer9, Fill),
             {{object, Num, Gen, {stream, Object, Data}}, Buffer10, State1}
     end.
-
-
-parse_object(Buffer, Fill) ->
-    {Token, Buffer1} = read_token(Buffer, Fill),
-    case Token of
-        '[' ->
-            parse_array(Buffer1, Fill);
-        '<<' ->
-            parse_dict(Buffer1, Fill);
-        null ->
-            null;
-        true ->
-            true;
-        false ->
-            false;
-        Keyword when is_atom(Keyword) ->
-            throw({error, {unexpected_keyword, Keyword}});
-        _ ->
-            {Token, Buffer1}
-    end.
-
-
-parse_array(Buffer, Fill) ->
-    parse_objects([], ']', Buffer, Fill).
-
-
-parse_dict(Buffer, Fill) ->
-    {List, Buffer1} = parse_objects([], '>>', Buffer, Fill),
-    {{dict, make_dict(List)}, Buffer1}.
-
-
-make_dict([]) ->
-    [];
-make_dict([{name,K}, V|T]) ->
-    [{K,V}|make_dict(T)].
-
-
-parse_objects(Stack, Until, Buffer, Fill) ->
-    {Token, Buffer1} = read_token(Buffer, Fill),
-    case Token of
-        Until ->
-            {lists:reverse(Stack), Buffer1};
-        '[' ->
-            {Object, Buffer2} = parse_array(Buffer1, Fill),
-            parse_objects([Object|Stack], Until, Buffer2, Fill);
-        '<<' ->
-            {Object, Buffer2} = parse_dict(Buffer1, Fill),
-            parse_objects([Object|Stack], Until, Buffer2, Fill);
-        'R' ->
-            [Gen, Num|Stack1] = Stack,
-            parse_objects([{ref, Num, Gen}|Stack1], Until, Buffer1, Fill);
-        null ->
-            parse_objects([Token|Stack], Until, Buffer1, Fill);
-        true ->
-            parse_objects([Token|Stack], Until, Buffer1, Fill);
-        false ->
-            parse_objects([Token|Stack], Until, Buffer1, Fill);
-        Keyword when is_atom(Keyword) ->
-            throw({error, {unexpected_keyword, Keyword}});
-        _ ->
-            parse_objects([Token|Stack], Until, Buffer1, Fill)
-    end.
-
-
-read_token(Buffer, Fill) ->
-    case Fill(2, Buffer) of
-        <<0, Buffer1/binary>> ->
-            read_token(Buffer1, Fill);
-        <<"\t", Buffer1/binary>> ->
-            read_token(Buffer1, Fill);
-        <<"\n", Buffer1/binary>> ->
-            read_token(Buffer1, Fill);
-        <<"\f", Buffer1/binary>> ->
-            read_token(Buffer1, Fill);
-        <<"\r", Buffer1/binary>> ->
-            read_token(Buffer1, Fill);
-        <<" ", Buffer1/binary>> ->
-            read_token(Buffer1, Fill);
-        <<"%", Buffer1/binary>> ->
-            {_, Buffer2} = readline(Buffer1, Fill),
-            read_token(Buffer2, Fill);
-        <<"(", Buffer1/binary>> ->
-            parse_string(0, <<>>, Buffer1, Fill);
-        <<"[", Buffer1/binary>> ->
-            {'[', Buffer1};
-        <<"]", Buffer1/binary>> ->
-            {']', Buffer1};
-        <<"/", Buffer1/binary>> ->
-            parse_name(<<>>, Buffer1, Fill);
-        <<"<<", Buffer1/binary>> ->
-            {'<<', Buffer1};
-        <<">>", Buffer1/binary>> ->
-            {'>>', Buffer1};
-        <<"<", Buffer1/binary>> ->
-            parse_hexstring(<<>>, Buffer1, Fill);
-        <<D, Buffer1/binary>>
-          when D >= $0, D =< $9 ->
-            parse_number(<<D>>, Buffer1, Fill);
-        <<".", Buffer1/binary>> ->
-            {S, Buffer2} = parse_integer(<<>>, Buffer1, Fill),
-            {binary_to_float(<<"0.", S/binary>>), Buffer2};
-        <<"+.", Buffer1/binary>> ->
-            {S, Buffer2} = parse_integer(<<>>, Buffer1, Fill),
-            {binary_to_float(<<"0.", S/binary>>), Buffer2};
-        <<"-.", Buffer1/binary>> ->
-            {S, Buffer2} = parse_integer(<<>>, Buffer1, Fill),
-            {-binary_to_float(<<"0.", S/binary>>), Buffer2};
-        <<"+", Buffer1/binary>> ->
-            {Num, Buffer2} = parse_number(<<>>, Buffer1, Fill),
-            {+Num, Buffer2};
-        <<"-", Buffer1/binary>> ->
-            {Num, Buffer2} = parse_number(<<>>, Buffer1, Fill),
-            {-Num, Buffer2};
-        <<C, Buffer1/binary>>
-          when C >= $a, C =< $z ->
-            parse_keyword(<<C>>, Buffer1, Fill);
-        <<C, Buffer1/binary>>
-          when C >= $A, C =< $Z ->
-            parse_keyword(<<C>>, Buffer1, Fill)
-    end.
-
-
-parse_string(N, S, Buffer, Fill) ->
-    case Fill(1, Buffer) of
-        <<"(", Buffer1/binary>> ->
-            parse_string(N+1, <<S/binary, "(">>, Buffer1, Fill);
-        <<")", Buffer1/binary>> ->
-            case N of
-                0 ->
-                    {S, Buffer1};
-                _ ->
-                    parse_string(N-1, <<S/binary, ")">>, Buffer1, Fill)
-            end;
-        <<"\\", Buffer1/binary>> ->
-            case Fill(3, Buffer1) of
-                <<"n", Buffer2/binary>> ->
-                    parse_string(N, <<S/binary, "\n">>, Buffer2, Fill);
-                <<"r", Buffer2/binary>> ->
-                    parse_string(N, <<S/binary, "\r">>, Buffer2, Fill);
-                <<"t", Buffer2/binary>> ->
-                    parse_string(N, <<S/binary, "\t">>, Buffer2, Fill);
-                <<"b", Buffer2/binary>> ->
-                    parse_string(N, <<S/binary, "\b">>, Buffer2, Fill);
-                <<"f", Buffer2/binary>> ->
-                    parse_string(N, <<S/binary, "\f">>, Buffer2, Fill);
-                <<"(", Buffer2/binary>> ->
-                    parse_string(N, <<S/binary, "(">>, Buffer2, Fill);
-                <<")", Buffer2/binary>> ->
-                    parse_string(N, <<S/binary, ")">>, Buffer2, Fill);
-                <<"\\", Buffer2/binary>> ->
-                    parse_string(N, <<S/binary, "\\">>, Buffer2, Fill);
-                <<A, B, C, Buffer2/binary>> ->
-                    A1 = oct2int(A),
-                    B1 = oct2int(B),
-                    C1 = oct2int(C),
-                    O = A1 * 64 + B1 * 8 + C1,
-                    parse_string(N, <<S/binary, O>>, Buffer2, Fill)
-            end;
-        <<C, Buffer1/binary>> ->
-            parse_string(N, <<S/binary, C>>, Buffer1, Fill)
-    end.
-
-
-parse_number(S, Buffer, Fill) ->
-    {S1, Buffer1} = parse_integer(S, Buffer, Fill),
-    case Fill(1, Buffer1) of
-        <<".", Buffer2/binary>> ->
-            {S2, Buffer3} = parse_integer(<<>>, Buffer2, Fill),
-            {binary_to_float(<<S1/binary, ".", S2/binary>>), Buffer3};
-        Buffer2 ->
-            {binary_to_integer(S1), Buffer2}
-    end.
-
-
-parse_integer(S, Buffer, Fill) ->
-    case Fill(1, Buffer) of
-        <<D, Buffer1/binary>>
-          when D >= $0, D =< $9->
-            parse_integer(<<S/binary, D>>, Buffer1, Fill);
-        Buffer1 ->
-            {S, Buffer1}
-    end.
-
-
-parse_keyword(S, Buffer, Fill) ->
-    case Fill(1, Buffer) of
-        <<C, Buffer1/binary>>
-          when C >= $a, C =< $z->
-            parse_keyword(<<S/binary, C>>, Buffer1, Fill);
-        <<C, Buffer1/binary>>
-          when C >= $A, C =< $Z->
-            parse_keyword(<<S/binary, C>>, Buffer1, Fill);
-        Buffer1 ->
-            {binary_to_atom(S, latin1), Buffer1}
-    end.
-
-
-parse_hexstring(S, Buffer, Fill) ->
-    case Fill(1, Buffer) of
-        <<">", Buffer1/binary>> ->
-            {hex2string(<<>>, S), Buffer1};
-        <<A, Buffer1/binary>>
-          when A >= $0, A =< $9 ->
-            parse_hexstring(<<S/binary, A>>, Buffer1, Fill);
-        <<A, Buffer1/binary>>
-          when A >= $a, A =< $f ->
-            parse_hexstring(<<S/binary, A>>, Buffer1, Fill);
-        <<A, Buffer1/binary>>
-          when A >= $A, A =< $F ->
-            parse_hexstring(<<S/binary, A>>, Buffer1, Fill)
-    end.
-
-
-parse_name(S, Buffer, Fill) ->
-    case Fill(1, Buffer) of
-        <<"(", _/binary>> = Buffer1 ->
-            {{name, binary_to_atom(S, latin1)}, Buffer1};
-        <<")", _/binary>> = Buffer1 ->
-            {{name, binary_to_atom(S, latin1)}, Buffer1};
-        <<"<", _/binary>> = Buffer1 ->
-            {{name, binary_to_atom(S, latin1)}, Buffer1};
-        <<">", _/binary>> = Buffer1 ->
-            {{name, binary_to_atom(S, latin1)}, Buffer1};
-        <<"[", _/binary>> = Buffer1 ->
-            {{name, binary_to_atom(S, latin1)}, Buffer1};
-        <<"]", _/binary>> = Buffer1 ->
-            {{name, binary_to_atom(S, latin1)}, Buffer1};
-        <<"{", _/binary>> = Buffer1 ->
-            {{name, binary_to_atom(S, latin1)}, Buffer1};
-        <<"}", _/binary>> = Buffer1 ->
-            {{name, binary_to_atom(S, latin1)}, Buffer1};
-        <<"/", _/binary>> = Buffer1 ->
-            {{name, binary_to_atom(S, latin1)}, Buffer1};
-        <<"%", _/binary>> = Buffer1 ->
-            {{name, binary_to_atom(S, latin1)}, Buffer1};
-        <<"#", Buffer1/binary>> ->
-            <<A, B, Buffer2/binary>> = Fill(2, Buffer1),
-            A1 = hex2int(A),
-            B1 = hex2int(B),
-            parse_name(<<S/binary, A1:4, B1:4>>, Buffer2, Fill);
-        <<C, Buffer1/binary>>
-          when C >= $!, C =< $~->
-            parse_name(<<S/binary, C>>, Buffer1, Fill);
-        Buffer1 ->
-            {{name, binary_to_atom(S, latin1)}, Buffer1}
-    end.
-
-
-oct2int(O)
-  when O >= $0, O =< $7 ->
-    O - $0.
-
-
-hex2int(H)
-  when H >= $0, H =< $9 ->
-    H - $0;
-hex2int(H)
-  when H >= $a, H =< $f ->
-    H - $a + 10;
-hex2int(H)
-  when H >= $A, H =< $F ->
-    H - $A + 10.
-
-
-hex2string(S, <<>>) ->
-    S;
-hex2string(S, <<A>>) ->
-    A1 = hex2int(A),
-    <<S/binary, A1:4, 0:4>>;
-hex2string(S, <<A, B, Rest/binary>>) ->
-    A1 = hex2int(A),
-    B1 = hex2int(B),
-    hex2string(<<S/binary, A1:4, B1:4>>, Rest).
-
-
-buffer(N, Buffer, File)
-  when size(Buffer) < N ->
-    N1 =
-        case N rem 1024 of
-            0 ->
-                N div 1024;
-            _ ->
-                N div 1024 + 1
-        end,
-    case file:read(File, N1 * 1024 - size(Buffer)) of
-        {ok, Data} ->
-            <<Buffer/binary, Data/binary>>;
-        eof ->
-            Buffer
-    end;
-buffer(_, Buffer, _File) ->
-    Buffer.
-
-
-readline(Line, Buffer, Fill) ->
-    Buffer1 = Fill(1024, Buffer),
-    case binary:match(Buffer1, [<<"\r">>, <<"\n">>, <<"\r\n">>]) of
-        nomatch ->
-            readline(<<Line/binary, Buffer1/binary>>, <<>>, Fill);
-        {Start, Length} ->
-            Part = binary:part(Buffer1, 0, Start),
-            Buffer3 =
-                case binary:part(Buffer1, Start+Length, size(Buffer1)-Start-Length) of
-                    <<>> ->
-                        case binary:part(Buffer1, Start, Length) of
-                            <<"\r">> ->
-                                case Fill(1024, <<>>) of
-                                    <<"\n", Buffer2/binary>> ->
-                                        Buffer2;
-                                    Buffer2 ->
-                                        Buffer2
-                                end;
-                            _ ->
-                                <<>>
-                        end;
-                    Buffer2 ->
-                        Buffer2
-                end,
-            {<<Line/binary, Part/binary>>, Buffer3}
-    end.
-
-
-readline(Buffer, Fill) ->
-    readline(<<>>, Buffer, Fill).
 
 
 skip_whitespace(Buffer, Fill) ->

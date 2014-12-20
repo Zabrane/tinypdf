@@ -25,10 +25,10 @@ init([]) ->
            permanent, 2000, worker,
            [tinypdf_file_server]
          },
-         { tinypdf_file_parser_sup,
-           {tinypdf_file_parser_sup, start_link, []},
+         { tinypdf_file_reader_sup,
+           {tinypdf_file_reader_sup, start_link, []},
            permanent, 2000, worker,
-           [tinypdf_file_parser_sup]
+           [tinypdf_file_reader_sup]
          }
         ],
 

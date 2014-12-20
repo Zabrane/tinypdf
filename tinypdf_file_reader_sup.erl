@@ -1,4 +1,4 @@
--module(tinypdf_file_parser_sup).
+-module(tinypdf_file_reader_sup).
 
 -behaviour(supervisor).
 
@@ -18,10 +18,10 @@ init([]) ->
      {
        {simple_one_for_one, 0, 1},
        [
-        { tinypdf_file_parser,
-          {tinypdf_file_parser, start_link, []},
+        { tinypdf_file_reader,
+          {tinypdf_file_reader, start_link, []},
           temporary, brutal_kill, worker,
-          [tinypdf_file_parser]
+          [tinypdf_file_reader]
         }
        ]
      }
