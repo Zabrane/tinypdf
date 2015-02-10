@@ -3,9 +3,8 @@
 -export([convert/1]).
 
 
-convert(Filename) ->
-    tinypdf_app:start(),
-    Reader = tinypdf_file_reader:open(Filename),
+convert(File) ->
+    Reader = tinypdf_file_reader:read_file(File),
     {_, Fonts} =
         lists:foldl(
           fun convert_page/2,

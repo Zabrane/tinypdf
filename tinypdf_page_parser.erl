@@ -1,6 +1,6 @@
 -module(tinypdf_page_parser).
 
--export([parse/1]).
+-export([parse/1).
 
 -record(
    state,

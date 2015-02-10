@@ -1,58 +1,33 @@
 -module(tinypdf_lru).
 
--export([new/1, insert/3, find/2]).
-
--record(lru, {capacity, size, serial, key2value, key2serial, serial2key}).
+-export([new/1, find/2, insert/3]).
 
 
 new(Capacity) ->
-    #lru {
-       capacity = Capacity,
-       size = 0,
-       serial = 0,
-       key2value = dict:new(),
-       key2serial = dict:new(),
-       serial2key = gb_trees:empty()
-      }.
+    Table = ets:new(lru_cache, [set, private]),
+    {lru, Capacity, 0, 0, Table}.
 
 
-insert(Key, Value, LRU = #lru{size=Size, serial=Serial, key2value=Key2Value, key2serial=Key2Serial, serial2key=Serial2Key}) ->
-    error = dict:find(Key, Key2Serial),
-    resize(
-        LRU #lru {
-          size = Size + 1,
-          serial = Serial + 1,
-          key2value = dict:store(Key, Value, Key2Value),
-          key2serial = dict:store(Key, Serial, Key2Serial),
-          serial2key = gb_trees:insert(Serial, Key, Serial2Key)
-         }).
+find(Key, {lru, Capacity, Size, Serial, Table}) ->
+    case ets:update_element(Table, Key, [{3, Serial}]) of
+        false ->
+            not_found;
+        true ->
+            {ets:lookup_element(Table, Key, 2),
+             {lru, Capacity, Size, Serial+1, Table}}
+    end.
 
 
-resize(LRU = #lru{capacity=Capacity, size=Size})
-  when Size =< Capacity ->
-    LRU;
-resize(LRU = #lru{size=Size, key2value=Key2Value, key2serial=Key2Serial, serial2key=Serial2Key}) ->
-    {Serial, Key} = gb_trees:smallest(Serial2Key),
-    LRU #lru {
-      size = Size - 1,
-      key2value = dict:erase(Key, Key2Value),
-      key2serial = dict:erase(Key, Key2Serial),
-      serial2key = gb_trees:delete(Serial, Serial2Key)
-     }.
+insert(Key, Value, {lru, Capacity, Size, Serial, Table}) ->
+    true = ets:insert_new(Table, {Key, Value, Serial}),
+    remove_old_entries({lru, Capacity, Size+1, Serial+1, Table}).
 
 
-find(Key, LRU = #lru{serial=Serial, key2value=Key2Value, key2serial=Key2Serial, serial2key=Serial2Key}) ->
-   case dict:find(Key, Key2Value) of
-       {ok, Value} ->
-           {ok, OldSerial} = dict:find(Key, Key2Serial),
-
-           { ok,
-             Value,
-             LRU #lru {
-               serial = Serial + 1,
-               key2serial = dict:store(Key, Serial, Key2Serial),
-               serial2key = gb_trees:insert(Serial, Key, gb_trees:delete(OldSerial, Serial2Key))
-              }};
-       error ->
-           error
-   end.
+remove_old_entries({lru, Capacity, Size, Serial, Table})
+  when Size > Capacity ->
+    OldSerial =
+        lists:min(ets:select(Table, [{{'_','_','$1'},[],['$1']}])),
+    Deleted = ets:select_delete(Table, [{{'_','_',OldSerial},[],[true]}]),
+    {lru, Capacity, Size-Deleted, Serial, Table};
+remove_old_entries(LRU) ->
+    LRU.

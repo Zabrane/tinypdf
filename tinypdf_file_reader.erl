@@ -2,111 +2,100 @@
 
 -behaviour(gen_server).
 
--export([start_link/5]).
+-export([start_link/3]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
 
 -export(
-   [ open/1,
+   [ read_file/1,
      root/1,
-     find_object/2,
      get_object/2,
+     find_object/2,
      get_streams/2,
      pages/1,
      number_of_pages/1,
-     page/2,
-     page_content/2
-   ]).
+     page_content/2,
+     find_page/3]).
 
--record(state, {file, version, root, info, offsets, object_cache, compressed_cache}).
-
-
-open(Filename) ->
-    {ok, File} = tinypdf_file_server:open(Filename),
-    {ok, Version} = read_header(File),
-    {ok, XRefOffset} = read_startxref(File),
-    {ok, _} = file:position(File, XRefOffset),
-    {Root, Info, Offsets} = read_trailer(fun(N,B) -> tinypdf_tokenizer:file_buffer(N,B,File) end),
-
-    Pid =
-        case supervisor:start_child(
-               tinypdf_file_reader_sup,
-               [File, Version, Root, Info, Offsets])
-        of
-            {ok, Child} ->
-                Child;
-            {ok, Child, _} ->
-                Child
-        end,
-
-    ok = tinypdf_file_server:controlling_process(File, Pid),
-    Pid.
+-export([load_object/4, load_object_stream/2]).
 
 
-root(Pid) ->
-    RootRef = gen_server:call(Pid, get_root),
-    {dict, Root} = Object = get_object(RootRef, Pid),
+-record(
+   state,
+   {file,
+    version,
+    offsets,
+    cache,
+    pid2ref,
+    ref2froms}).
+
+
+read_file(File) ->
+    {Version, Root, Info, Offsets} = tinypdf_file_parser:parse_file(File),
+    {ok, Pid} = start_link(File, Version, dict:to_list(Offsets)),
+    {pdf_file, Pid, Root, Info}.
+
+
+root(File = {pdf_file, _, RootRef, _}) ->
+    {dict, Root} = get_object(RootRef, File),
     {_, {name, 'Catalog'}} = proplists:lookup('Type', Root),
+    Root.
+
+
+get_object(Ref, File) ->
+    {ok, Object} = find_object(Ref, File),
     Object.
 
 
-find_object({ref, _, _} = Ref, Pid) ->
-    gen_server:call(Pid, {find_object, Ref}).
+find_object(Ref, {pdf_file, Pid, _, _}) ->
+    gen_server:call(Pid, {get_object, Ref}).
 
 
-get_object({ref, _, _} = Ref, Pid) ->
-    {ok, Object} = find_object(Ref, Pid),
-    Object;
-get_object(Object, _Pid) ->
-    Object.
-
-
-get_streams([], Stream, _Pid) ->
+get_streams([], Stream, _File) ->
     Stream;
-get_streams([H|T], Stream, Pid) ->
-    Stream1 = get_streams(H, Stream, Pid),
-    get_streams(T, Stream1, Pid);
-get_streams({ref, _, _} = Ref, Stream, Pid) ->
-    {stream, _, Data} = get_object(Ref, Pid),
+get_streams([H|T], Stream, File) ->
+    Stream1 = get_streams(H, Stream, File),
+    get_streams(T, Stream1, File);
+get_streams({ref, _, _} = Ref, Stream, File) ->
+    {stream, _, Data} = get_object(Ref, File),
     <<Stream/binary, Data/binary>>.
 
-get_streams(StreamRefs, Pid) ->
-    get_streams(StreamRefs, <<>>, Pid).
+
+get_streams(StreamRefs, File) ->
+    get_streams(StreamRefs, <<>>, File).
 
 
-pages(Pid) ->
-    {dict, Root} = root(Pid),
+pages(File) ->
+    Root = root(File),
     {_, PagesRef} = proplists:lookup('Pages', Root),
-    {dict, Pages} = Object = get_object(PagesRef, Pid),
+    {dict, Pages} = get_object(PagesRef, File),
     {_, {name, 'Pages'}} = proplists:lookup('Type', Pages),
-    Object.
+    Pages.
 
 
-number_of_pages(Pid) ->
-    {dict, Pages} = pages(Pid),
+number_of_pages(File) ->
+    Pages = pages(File),
     {_, Count} = proplists:lookup('Count', Pages),
     Count.
 
-
-page(N, Pid) ->
-    {dict, Pages} = pages(Pid),
+page(N, File) ->
+    Pages = pages(File),
     {_, KidRefs} = proplists:lookup('Kids', Pages),
-    {ok, Page} = find_page(N, KidRefs, Pid),
+    {ok, Page} = find_page(N, KidRefs, File),
     Page.
 
 
-page_content(N, Pid) ->
-    {dict, Page} = page(N, Pid),
+page_content(N, File) ->
+    {dict, Page} = page(N, File),
     {_, ContentRef} = proplists:lookup('Contents', Page),
-    {stream, {dict, _Dict}, Stream} = get_object(ContentRef, Pid),
-    io:format("~s~n", [Stream]).
+    get_streams(ContentRef, File).
 
 
-find_page(_, [], _Pid) ->
+find_page(_, [], _File) ->
     error;
-find_page(N, [H|T], Pid) ->
-    {dict, Node} = Page = get_object(H, Pid),
+find_page(N, [H|T], File) ->
+    {dict, Node} = Page = get_object(H, File),
     {_, Type} = proplists:lookup('Type', Node),
     case Type of
         {name, 'Page'} ->
@@ -114,51 +103,162 @@ find_page(N, [H|T], Pid) ->
                 1 ->
                     {ok, Page};
                 _ ->
-                    find_page(N-1, T, Pid)
+                    find_page(N-1, T, File)
             end;
         {name, 'Pages'} ->
             {_, Count} = proplists:lookup('Count', Node),
             case N =< Count of
                 true ->
                     {_, KidRefs} = proplists:lookup('Kids', Node),
-                    find_page(N, KidRefs, Pid);
+                    find_page(N, KidRefs, File);
                 false ->
-                    find_page(N-Count, T, Pid)
+                    find_page(N-Count, T, File)
             end
     end.
 
 
-start_link(File, Version, Root, Info, Offsets) ->
-    gen_server:start_link(?MODULE, [File, Version, Root, Info, Offsets], []).
+start_link(File, Version, Offsets) ->
+    gen_server:start_link(?MODULE, [File, Version, Offsets], []).
 
 
-init([File, Version, Root, Info, Offsets]) ->
+init([File, Version, Offsets]) ->
+    process_flag(trap_exit, true),
+    OffsetTable =
+        ets:new(offsets, [set, {read_concurrency,true}]),
+    true = ets:insert(OffsetTable, Offsets),
+
     { ok,
       #state{
          file = File,
          version = Version,
-         root = Root,
-         info = Info,
-         offsets = dict:from_list(Offsets),
-         object_cache = tinypdf_lru:new(1024),
-         compressed_cache = tinypdf_lru:new(1024)}
+         offsets = OffsetTable,
+         cache = tinypdf_lru:new(1024),
+         pid2ref = dict:new(),
+         ref2froms = dict:new()}
     }.
 
 
-handle_call(get_root, _From, State = #state{root=Root}) ->
-    {reply, Root, State};
-handle_call({find_object, Ref}, _From, State) ->
-    case lookup_object(Ref, State) of
-        {ok, Object, State1} ->
-            {reply, {ok, Object}, State1};
-        {error, State1} ->
-            {reply, error, State1}
+handle_call(
+  {get_object, Ref}, From,
+  State=#state{file=File, offsets=Offsets, cache=Cache,
+               pid2ref=Pid2Ref, ref2froms=Ref2Froms}
+ ) ->
+    case tinypdf_lru:find(Ref, Cache) of
+        {Value, Cache1} ->
+            {reply, {ok, Value}, State#state{cache=Cache1}};
+        not_found ->
+            Pid2Ref1 =
+                case dict:is_key(Ref, Ref2Froms) of
+                    true ->
+                        Pid2Ref;
+                    false ->
+                        Pid = spawn_link(tinypdf_file_reader, load_object, [File,self(),Offsets,Ref]),
+                        dict:store(Pid, Ref, Pid2Ref)
+                end,
+
+            {noreply,
+             State#state{
+               pid2ref = Pid2Ref1,
+               ref2froms = dict:append(Ref, From, Ref2Froms)
+              }}
     end;
+
+handle_call(
+  {get_compressed_object, Ref, Index}, From,
+  State=#state{cache=Cache,
+               pid2ref=Pid2Ref, ref2froms=Ref2Froms}
+ ) ->
+    case tinypdf_lru:find({compressed, Ref, Index}, Cache) of
+        {Value, Cache1} ->
+            {ok, Value, State#state{cache=Cache1}};
+        not_found ->
+            Pid2Ref1 =
+                case dict:is_key({object_stream, Ref}, Ref2Froms) of
+                    true ->
+                        Pid2Ref;
+                    false ->
+                        Pid = spawn_link(tinypdf_file_reader, load_object_stream, [self(),Ref]),
+                        dict:store(Pid, Ref, Pid2Ref)
+                end,
+
+            {noreply,
+             State#state{
+               pid2ref = Pid2Ref1,
+               ref2froms = dict:append({object_stream, Ref}, {From, Index}, Ref2Froms)
+              }}
+    end;
+
+handle_call(
+  {object_result, Ref, Result}, {Pid, _},
+  State=#state{pid2ref=Pid2Ref, ref2froms=Ref2Froms, cache=Cache}) ->
+    true = unlink(Pid),
+    {ok, Ref} = dict:find(Pid, Pid2Ref),
+    [ gen_server:reply(From, Result)
+      || From <- dict:fetch(Ref, Ref2Froms) ],
+    Cache1 =
+        case Result of
+            not_found ->
+                Cache;
+            {ok, Object} ->
+                tinypdf_lru:insert(Ref, Object, Cache)
+        end,
+
+    {reply, ok,
+     State#state{
+       pid2ref=dict:erase(Pid, Pid2Ref),
+       ref2froms=dict:erase(Ref, Ref2Froms),
+       cache=Cache1}};
+handle_call(
+  {object_stream_result, Ref, Result}, {Pid, _},
+  State=#state{pid2ref=Pid2Ref, ref2froms=Ref2Froms, cache=Cache}) ->
+    true = unlink(Pid),
+    {ok, Ref} = dict:find(Pid, Pid2Ref),
+    Cache1 =
+        case Result of
+            not_found ->
+                [ gen_server:reply(From, not_found)
+                  || {From, _} <- dict:fetch(Ref, Ref2Froms) ],
+                Cache;
+            {ok, Objects} ->
+                [ gen_server:reply(From, {ok, lists:nth(N+1, Objects)})
+                  || {From, N} <- dict:fetch(Ref, Ref2Froms) ],
+                tinypdf_lru:insert(Ref, Objects, Cache)
+        end,
+    {reply, ok,
+     State#state{
+       pid2ref=dict:erase(Pid, Pid2Ref),
+       ref2froms=dict:erase(Ref, Ref2Froms),
+       cache=Cache1}};
 handle_call(_Request, _From, State) ->
     {reply, {error, badrequest}, State}.
 
 handle_cast(_Msg, State) ->
     {noreply, State}.
+
+handle_info(
+  {'EXIT', Pid, Reason},
+  State=#state{pid2ref=Pid2Ref, ref2froms=Ref2Froms}) ->
+    true = unlink(Pid),
+    case dict:find(Pid, Pid2Ref) of
+        error ->
+            {noreply, State};
+        {ok, {object_stream, Ref}} ->
+            [ gen_server:reply(From, {error, Reason})
+                  || {From, _} <- dict:fetch(Ref, Ref2Froms) ],
+            {noreply,
+             State#state{
+               pid2ref=dict:erase(Pid, Pid2Ref),
+               ref2froms=dict:erase({object_stream, Ref}, Ref2Froms)
+              }};
+        {ok, Ref} ->
+            [ gen_server:reply(From, {error, Reason})
+              || From <- dict:fetch(Ref, Ref2Froms) ],
+            {noreply,
+             State#state{
+               pid2ref=dict:erase(Pid, Pid2Ref),
+               ref2froms=dict:erase(Ref, Ref2Froms)
+              }}
+    end;
 
 handle_info(_Info, State) ->
     {noreply, State}.
@@ -170,261 +270,54 @@ code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
 
+load_object(File, Reader, Offsets, Ref) ->
+    case ets:lookup(Offsets, Ref) of
+        [] ->
+            ok =
+                gen_server:call(
+                  Reader,
+                  {object_result, Ref, not_found});
+        [{{ref, Num, Gen}, Offset}] when is_integer(Offset) ->
+            {object, Num, Gen, Result} =
+                tinypdf_file_parser:get_object_from_offset(
+                  Offset,
+                  File,
+                  Reader),
 
-lookup_object(Ref = {ref, Num, Gen}, State = #state{offsets=Offsets, object_cache=ObjectCache}) ->
-    case tinypdf_lru:find(Ref, ObjectCache) of
-        error ->
-            case dict:find(Ref, Offsets) of
-                {ok, Offset} when is_integer(Offset) ->
-                    {{object, Num, Gen, Object}, State1} = get_object_from_offset(Offset, State),
-                    State2 = State1#state{object_cache=tinypdf_lru:insert(Ref, Object, State1#state.object_cache)},
-                    {ok, Object, State2};
-                {ok, {compressed, Ref1, Index}} ->
-                    {Object, State1} = lookup_compressed_object(Ref1, Index, State),
-                    State2 = State1#state{object_cache=tinypdf_lru:insert(Ref, Object, State1#state.object_cache)},
-                    {ok, Object, State2};
-                error ->
-                    {error, State}
-            end;
-        {ok, Value, ObjectCache1} ->
-            {ok, Value, State#state{object_cache=ObjectCache1}}
+            ok =
+                gen_server:call(
+                  Reader,
+                  {object_result, Ref, {ok, Result}});
+        [{Ref, {compressed, Ref1, Index}}] ->
+            Result =
+                gen_server:call(
+                  Reader,
+                  {get_compressed_object, Ref1, Index}),
+            ok =
+                gen_server:call(
+                  Reader,
+                  {object_result, Ref, {ok, Result}})
     end.
 
 
-get_object_from_offset(Offset, State = #state{file=File}) ->
-    {ok, _} = file:position(File, Offset),
+load_object_stream(Reader, Ref) ->
+    {ok, {stream, {dict, Dict}, Stream}} =
+        gen_server:call(Reader, {get_object, Ref}),
 
-    case parse_indirect_object(<<>>, fun(N,B) -> tinypdf_tokenizer:file_buffer(N,B,File) end, State) of
-        {{object, Num, Ref, {stream, {dict, Dict}, RawStream}}, _, State1} ->
-            {Filter, State2} = resolve_refs(proplists:get_value('Filter', Dict, null), State1),
-            {DecodeParms, State3} = resolve_refs(proplists:get_value('DecodeParms', Dict, null), State2),
-            Stream = tinypdf_stream_filter:decode(Filter, DecodeParms, RawStream),
-            {{object, Num, Ref, {stream, {dict, Dict}, Stream}}, State3};
-        {Object, _, State1} ->
-            {Object, State1}
-    end.
-
-
-
-lookup_compressed_object(Ref, Index, State = #state{compressed_cache=CompressedCache}) ->
-    {List, State3} =
-        case tinypdf_lru:find(Ref, CompressedCache) of
-            error ->
-                {Objects, State1} = get_compressed_objects(Ref, State),
-                State2 = State1#state{compressed_cache=tinypdf_lru:insert(Ref, Objects, State1#state.compressed_cache)},
-                {Objects, State2};
-            {ok, Value, CompressedCache1} ->
-                {Value, State#state{compressed_cache=CompressedCache1}}
-        end,
-    {lists:nth(Index+1, List), State3}.
-
-
-get_compressed_objects(Ref, State) ->
-    {ok,  {stream, {dict, Dict}, Stream}, State1} = lookup_object(Ref, State),
     {_, {name, 'ObjStm'}} = proplists:lookup('Type', Dict),
     null = proplists:get_value('Extends', Dict, null), %% TODO
     {_, First} = proplists:lookup('First', Dict),
     {_, N} = proplists:lookup('N', Dict),
 
-    Buffer = binary:part(Stream, First, size(Stream) - First),
-
     {Objects, _} =
         lists:mapfoldl(
-          fun (_, B) ->
-                  tinypdf_object_parser:parse_object(B, fun(_,Buf)-> Buf end)
+          fun (_, Loc) ->
+                  tinypdf_object_parser:parse_object(Stream, Loc)
           end,
-          Buffer,
+          First,
           lists:seq(1,N)),
-    {Objects, State1}.
 
-
-resolve_refs([], State) ->
-    {[], State};
-resolve_refs([H|T], State) ->
-    {H1, State1} = resolve_refs(H, State),
-    {T1, State2} = resolve_refs(T, State1),
-    {[H1|T1], State2};
-resolve_refs({dict, Dict}, State) ->
-    {Dict1, State1} = resolve_refs(Dict, State),
-    {{dict, Dict1}, State1};
-resolve_refs({ref, _, _}=Ref, State = #state{file=File}) ->
-    {ok, Pos} = file:position(File, cur),
-    {ok, Value, State1} = lookup_object(Ref, State),
-    {ok, _} = file:position(File, Pos),
-    {Value, State1};
-resolve_refs(Value, State) ->
-    {Value, State}.
-
-
-read_header(File) ->
-    case file:read(File, 8) of
-        {ok, <<"%PDF-1.", Version>>}
-          when Version >= $0, Version =< $7->
-            {ok, {1, Version-$0}};
-        _ ->
-            error
-    end.
-
-
-read_eof(File) ->
-    {ok, _} = file:position(File, {eof, -7}),
-    case file:read(File, 7) of
-        {ok, <<"%%EOF", _, _>>} ->
-            {ok, -7};
-        {ok, <<_, "%%EOF", _>>} ->
-            {ok, -6};
-        {ok, <<_, _, "%%EOF">>} ->
-            {ok, -5};
-        _ ->
-            error
-    end.
-
-
-read_startxref(File) ->
-    {ok, FileSize} = file:position(File, eof),
-    {ok, EOFOffset} = read_eof(File),
-    Offset = EOFOffset - length(integer_to_list(FileSize)) - 13,
-    {ok, _} = file:position(File, {eof, Offset}),
-    Length = -Offset+EOFOffset,
-    {ok, Tail} = file:read(File, Length),
-    {Start, 9} = binary:match(Tail, <<"startxref">>),
-    [<<>>, XRefOffset, <<>>] =
-        binary:split(
-          binary:part(Tail, {Start+9, Length-Start-9}),
-          [<<"\r">>, <<"\n">>, <<"\r\n">>], [global]),
-    {ok, binary_to_integer(XRefOffset)}.
-
-
-read_trailer(Fill) ->
-    Buffer = Fill(4, skip_whitespace(<<>>, Fill)),
-    {Offsets, Trailer} =
-        case Buffer of
-            <<"xref", _/binary>> ->
-                parse_trailer(Buffer, Fill);
-            _ ->
-                parse_xref_stream(Buffer, Fill)
-        end,
-    null = proplists:get_value('XRefStm', Trailer, null), %% TODO
-    {_, Root} = proplists:lookup('Root', Trailer),
-    {_, Info} = proplists:lookup('Info', Trailer),
-    {Root, Info, dict:to_list(Offsets)}.
-
-
-parse_xref_stream(Buffer, Fill) ->
-    {{object, _, _, {stream, {dict, Dict}, RawStream}}, _Buffer1, _} = parse_indirect_object(Buffer, Fill, null),
-    Stream =
-        tinypdf_stream_filter:decode(
-          proplists:get_value('Filter', Dict, null),
-          proplists:get_value('DecodeParms', Dict, null),
-          RawStream),
-    {_, {name, 'XRef'}} = proplists:lookup('Type', Dict),
-    {_, Size} = proplists:lookup('Size', Dict),
-    [Start, Count] = proplists:get_value('Index', Dict, [0, Size]),
-    {_, W} = proplists:lookup('W', Dict),
-    Offsets = parse_xref_entries(Start, Count, dict:new(), W, Stream),
-    {Offsets, Dict}.
-
-
-parse_xref_entries(_, 0, Offsets, _, <<>>) ->
-    Offsets;
-parse_xref_entries(Start, Count, Offsets, W, Stream) ->
-    case split_bytes([], W, Stream) of
-        {[0, _Num, _Gen], Stream1} ->
-            parse_xref_entries(Start+1, Count-1, Offsets, W, Stream1);
-        {[1, Offset, Gen], Stream1} ->
-            Offsets1 = dict:store({ref, Start, Gen}, Offset, Offsets),
-            parse_xref_entries(Start+1, Count-1, Offsets1, W, Stream1);
-        {[2, Num, Index], Stream1} ->
-            Offsets1 = dict:store({ref, Start, 0}, {compressed, {ref, Num, 0}, Index}, Offsets),
-            parse_xref_entries(Start+1, Count-1, Offsets1, W, Stream1)
-    end.
-
-
-split_bytes(Bytes, [], Stream) ->
-    {lists:reverse(Bytes), Stream};
-split_bytes(Bytes, [H|T], Stream) ->
-    split_bytes(
-      [binary:decode_unsigned(binary:part(Stream, 0, H))|Bytes],
-      T,
-      binary:part(Stream, H, size(Stream)-H)).
-
-
-parse_trailer(Buffer, Fill) ->
-    {xref, Buffer1} = tinypdf_tokenizer:read_token(Buffer, Fill),
-    {Offsets, Buffer2} = parse_xref_subsections(dict:new(), Buffer1, Fill),
-    {{dict, Trailer}, _Buffer3} = tinypdf_object_parser:parse_object(Buffer2, Fill),
-    {Offsets, Trailer}.
-
-
-parse_xref_subsections(Offsets, Buffer, Fill) ->
-    case tinypdf_tokenizer:read_token(Buffer, Fill) of
-        {trailer, Buffer1} ->
-            {Offsets, Buffer1};
-        {Start, Buffer1} when is_integer(Start) ->
-            {Count, Buffer2} = tinypdf_tokenizer:read_token(Buffer1, Fill),
-            {_, Buffer3} = tinypdf_tokenizer:readline(Buffer2, Fill),
-            {Offsets1, Buffer4} = parse_xref_subsection(Start, Count, Offsets, Buffer3, Fill),
-            parse_xref_subsections(Offsets1, Buffer4, Fill)
-    end.
-
-
-parse_xref_subsection(_Start, 0, Offsets, Buffer, _Fill) ->
-    {Offsets, Buffer};
-parse_xref_subsection(Start, Count, Offsets, Buffer, Fill) ->
-    {Offsets2, Buffer2} =
-        case Fill(20, Buffer) of
-            <<Offset:10/binary, " ", Gen:5/binary, " n", _, _, Buffer1/binary>> ->
-                Offsets1 = dict:store({ref, Start, binary_to_integer(Gen)}, binary_to_integer(Offset), Offsets),
-                {Offsets1, Buffer1};
-            <<_Offset:10/binary, " ", _Gen:5/binary, " f", _, _, Buffer1/binary>> ->
-                {Offsets, Buffer1}
-        end,
-    parse_xref_subsection(Start+1, Count-1, Offsets2, Buffer2, Fill).
-
-
-parse_indirect_object(Buffer, Fill, State) ->
-    {Num, Buffer1} = tinypdf_tokenizer:read_token(Buffer, Fill),
-    {Gen, Buffer2} = tinypdf_tokenizer:read_token(Buffer1, Fill),
-    {obj, Buffer3} = tinypdf_tokenizer:read_token(Buffer2, Fill),
-    {Object, Buffer4} = tinypdf_object_parser:parse_object(Buffer3, Fill),
-
-    case tinypdf_tokenizer:read_token(Buffer4, Fill) of
-        {endobj, Buffer5} ->
-            {{object, Num, Gen, Object}, Buffer5, State};
-        {stream, Buffer5} ->
-            {dict, Dict} = Object,
-            {_, RawLength} = proplists:lookup('Length', Dict),
-
-            {Length, State1} =
-                case State of
-                    null ->
-                        {RawLength, State};
-                    _ ->
-                        resolve_refs(RawLength, State)
-                end,
-
-            {_, Buffer6} = tinypdf_tokenizer:readline(Buffer5, Fill),
-            Buffer7 = Fill(Length, Buffer6),
-            Data = binary:part(Buffer7, 0, Length),
-            Buffer8 = binary:part(Buffer7, Length, size(Buffer7) - Length),
-
-
-            {endstream, Buffer9} = tinypdf_tokenizer:read_token(Buffer8, Fill),
-            {endobj, Buffer10} = tinypdf_tokenizer:read_token(Buffer9, Fill),
-            {{object, Num, Gen, {stream, Object, Data}}, Buffer10, State1}
-    end.
-
-
-skip_whitespace(Buffer, Fill) ->
-    case Fill(1, Buffer) of
-        <<0, Buffer1/binary>> ->
-            skip_whitespace(Buffer1, Fill);
-        <<"\t", Buffer1/binary>> ->
-            skip_whitespace(Buffer1, Fill);
-        <<"\f", Buffer1/binary>> ->
-            skip_whitespace(Buffer1, Fill);
-        <<" ", Buffer1/binary>> ->
-            skip_whitespace(Buffer1, Fill);
-        Buffer1 ->
-            Buffer1
-    end.
+    ok =
+        gen_server:call(
+          Reader,
+          {object_stream_result, {object_stream, Ref}, {ok, Objects}}).
